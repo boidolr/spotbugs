@@ -30,13 +30,20 @@ import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
 
 import org.apache.bcel.Const;
+import org.apache.bcel.classfile.Constant;
+import org.apache.bcel.classfile.ConstantInvokeDynamic;
+import org.apache.bcel.classfile.ConstantNameAndType;
+import org.apache.bcel.classfile.ConstantUtf8;
 import org.apache.bcel.classfile.Field;
 import org.apache.bcel.classfile.JavaClass;
 import org.apache.bcel.classfile.Method;
 import org.apache.bcel.generic.ConstantPoolGen;
 import org.apache.bcel.generic.FieldInstruction;
+import org.apache.bcel.generic.INVOKEDYNAMIC;
 import org.apache.bcel.generic.InvokeInstruction;
 import org.apache.bcel.generic.MethodGen;
+import org.apache.bcel.generic.ObjectType;
+import org.apache.bcel.generic.Type;
 import org.objectweb.asm.Opcodes;
 
 import edu.umd.cs.findbugs.FieldAnnotation;
@@ -612,11 +619,92 @@ public class XFactory {
      * @return XMethod representing the method called by the InvokeInstruction
      */
     public static XMethod createXMethod(InvokeInstruction invokeInstruction, ConstantPoolGen cpg) {
-        String className = invokeInstruction.getClassName(cpg);
-        String methodName = invokeInstruction.getName(cpg);
-        String methodSig = invokeInstruction.getSignature(cpg);
+        String className;
+        String methodName;
+        String methodSig;
+        if (invokeInstruction instanceof INVOKEDYNAMIC) {
+            XMethod xMethod = tryToCreateMethodForLambda((INVOKEDYNAMIC) invokeInstruction, cpg);
+            if (xMethod != null) {
+                return xMethod;
+            }
+            // this is just in case the code above will not work
+        }
 
+        className = invokeInstruction.getClassName(cpg);
+        methodName = invokeInstruction.getName(cpg);
+        methodSig = invokeInstruction.getSignature(cpg);
         return createXMethod(className, methodName, methodSig, invokeInstruction.getOpcode() == Const.INVOKESTATIC);
+    }
+
+    @CheckForNull
+    private static XMethod tryToCreateMethodForLambda(INVOKEDYNAMIC indy, ConstantPoolGen cpg) {
+        Constant constant = cpg.getConstant(indy.getIndex());
+        if (!(constant instanceof ConstantInvokeDynamic)) {
+            return null;
+        }
+        // @formatter:off
+        /*
+        INVOKEDYNAMIC run(LghIssues/Issue527;)Ljava/lang/Runnable; [
+          // handle kind 0x6 : INVOKESTATIC
+          java/lang/invoke/LambdaMetafactory.metafactory(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;
+          // arguments:
+          ()V,
+          // handle kind 0x7 : INVOKESPECIAL
+          ghIssues/Issue527.lambda$0()V,
+          ()V
+
+        // opcode 186, length 5, index 22
+        invokedynamic[186](5) 22
+
+          6 CONSTANT_Utf8[1]("()V")
+         19 CONSTANT_NameAndType[12](name_index = 20, signature_index = 21)
+         20 CONSTANT_Utf8[1]("run")
+         21 CONSTANT_Utf8[1]("(LghIssues/Issue527;)Ljava/lang/Runnable;")
+         22 CONSTANT_InvokeDynamic[18](bootstrap_method_attr_index = 0, name_and_type_index = 19)
+         36 CONSTANT_Utf8[1]("lambda$0")
+         53 CONSTANT_NameAndType[12](name_index = 36, signature_index = 6)
+         *
+         *
+         * */
+        // @formatter:on
+
+        String className = null;
+        ConstantInvokeDynamic idc = (ConstantInvokeDynamic) constant;
+        int index = idc.getBootstrapMethodAttrIndex();
+        Type[] argumentTypes = indy.getArgumentTypes(cpg);
+        if (argumentTypes.length > 0) {
+            Type t = argumentTypes[0];
+            if (t instanceof ObjectType) {
+                ObjectType objectType = (ObjectType) t;
+                className = objectType.getClassName();
+            }
+        }
+        if (className == null) {
+            return null;
+        }
+        String methodName = "lambda$" + index;
+        int mni = cpg.lookupUtf8(methodName);
+        if (mni < 0) {
+            return null;
+        }
+        int cpSize = cpg.getSize();
+        for (int i = 0; i < cpSize; i++) {
+            Constant c = cpg.getConstant(i);
+            if (c instanceof ConstantNameAndType) {
+                ConstantNameAndType cnt = (ConstantNameAndType) c;
+                if (cnt.getNameIndex() != mni) {
+                    continue;
+                }
+                int signatureIndex = cnt.getSignatureIndex();
+                Constant si = cpg.getConstant(signatureIndex);
+                if (si instanceof ConstantUtf8) {
+                    ConstantUtf8 cutf8 = (ConstantUtf8) si;
+                    String methodSig = cutf8.getBytes();
+                    return createXMethod(className, methodName, methodSig, false);
+                }
+            }
+        }
+        return null;
     }
 
     /**
